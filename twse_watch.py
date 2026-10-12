@@ -11,6 +11,10 @@
   4. 每天執行一次： python3 twse_watch.py
      可以用 cron / 排程器設成每天自動跑一次，每次執行的結果會附加記錄到 log.jsonl
 
+內建「財報探測器」（build_red_flags）：用應收帳款/存貨成長是否超過營收、
+毛利率單期波動、現金流與淨利是否持續背離、負債比率是否快速上升等常見會計
+紅旗規則，標出財報裡值得多看一眼的地方。
+
 這個工具只做「資料整理與描述」，不會告訴你要不要買賣，判斷請自行斟酌，
 也請自行核對公開資訊，不保證資料完全正確或即時。
 """
@@ -166,8 +170,16 @@ def analyze_stock(code, today):
         if prev_year_fin and prev_year_fin.get("Revenue"):
             report["yoy"] = pct(revenue - prev_year_fin["Revenue"], prev_year_fin["Revenue"])
 
-        # ---- 資產負債表：抓最近一筆算 ROE、負債比率 ----
-        bal_rows = safe_fetch("資產負債表", "TaiwanStockBalanceSheet", code, (today - datetime.timedelta(days=200)).isoformat())
+        prev_fin = fin_periods[1][1] if len(fin_periods) >= 2 else None
+        if prev_fin and prev_fin.get("Revenue"):
+            report["revenue_qoq"] = pct(revenue - prev_fin["Revenue"], prev_fin["Revenue"])
+        if prev_fin and prev_fin.get("GrossProfit") and prev_fin.get("Revenue"):
+            prev_gross_margin = pct(prev_fin["GrossProfit"], prev_fin["Revenue"])
+            if report.get("gross_margin") is not None and prev_gross_margin is not None:
+                report["gross_margin_delta"] = report["gross_margin"] - prev_gross_margin
+
+        # ---- 資產負債表：抓兩年，算 ROE、負債比率，以及應收/存貨相對營收的成長差 ----
+        bal_rows = safe_fetch("資產負債表", "TaiwanStockBalanceSheet", code, (today - datetime.timedelta(days=730)).isoformat())
         bal_periods = sorted(pivot_by_date(bal_rows).items(), key=lambda kv: kv[0], reverse=True)
         if bal_periods:
             _, latest_bal = bal_periods[0]
@@ -178,16 +190,62 @@ def analyze_stock(code, today):
             if net_income is not None and equity_parent:
                 report["roe"] = pct(net_income, equity_parent)
 
-        # ---- 現金流量表：算現金流/淨利比 ----
-        cf_rows = safe_fetch("現金流量表", "TaiwanStockCashFlowsStatement", code, (today - datetime.timedelta(days=200)).isoformat())
+            if len(bal_periods) >= 2:
+                _, prev_bal = bal_periods[1]
+                prev_debt_ratio = pct(prev_bal.get("Liabilities"), prev_bal.get("TotalAssets"))
+                if report.get("debt_ratio") is not None and prev_debt_ratio is not None:
+                    report["debt_ratio_delta"] = report["debt_ratio"] - prev_debt_ratio
+
+                ar, prev_ar = latest_bal.get("AccountsReceivableNet"), prev_bal.get("AccountsReceivableNet")
+                inv, prev_inv = latest_bal.get("Inventories"), prev_bal.get("Inventories")
+                rev_qoq = report.get("revenue_qoq")
+                if ar is not None and prev_ar and rev_qoq is not None:
+                    report["ar_vs_revenue_gap"] = pct(ar - prev_ar, prev_ar) - rev_qoq
+                if inv is not None and prev_inv and rev_qoq is not None:
+                    report["inv_vs_revenue_gap"] = pct(inv - prev_inv, prev_inv) - rev_qoq
+
+        # ---- 現金流量表：抓兩年，算現金流/淨利比與趨勢 ----
+        cf_rows = safe_fetch("現金流量表", "TaiwanStockCashFlowsStatement", code, (today - datetime.timedelta(days=730)).isoformat())
         cf_periods = sorted(pivot_by_date(cf_rows).items(), key=lambda kv: kv[0], reverse=True)
         if cf_periods and net_income:
             _, latest_cf = cf_periods[0]
             cfo = latest_cf.get("NetCashInflowFromOperatingActivities")
             if cfo is not None:
                 report["cf_ratio"] = cfo / net_income
+            if len(cf_periods) >= 2 and prev_fin and prev_fin.get("IncomeAfterTaxes"):
+                _, prev_cf = cf_periods[1]
+                prev_cfo = prev_cf.get("NetCashInflowFromOperatingActivities")
+                if prev_cfo is not None:
+                    report["cf_ratio_prev"] = prev_cfo / prev_fin["IncomeAfterTaxes"]
 
     return report
+
+
+def build_red_flags(r):
+    """財報探測器：常見的會計/財務紅旗檢查，只做描述，不是投資建議。"""
+    flags = []
+    if r.get("debt_ratio") is not None and r["debt_ratio"] > 60:
+        flags.append(("warn", f"負債比率偏高（{fmt_num(r['debt_ratio'])}%）"))
+    if r.get("debt_ratio_delta") is not None and r["debt_ratio_delta"] > 5:
+        flags.append(("warn", f"負債比率較上一期上升 {r['debt_ratio_delta']:.1f} 個百分點，留意財務結構變化"))
+
+    if r.get("cf_ratio") is not None and r.get("cf_ratio_prev") is not None \
+            and r["cf_ratio"] < 0.8 and r["cf_ratio_prev"] < 0.8:
+        flags.append(("warn", f"連續兩期現金流／淨利比皆偏低（{r['cf_ratio_prev']:.2f} → {r['cf_ratio']:.2f}），獲利品質值得留意"))
+    elif r.get("cf_ratio") is not None and r["cf_ratio"] < 0.8:
+        flags.append(("warn", f"現金流／淨利比偏低（{r['cf_ratio']:.2f}）"))
+
+    if r.get("ar_vs_revenue_gap") is not None and r["ar_vs_revenue_gap"] > 10:
+        flags.append(("warn", f"應收帳款成長速度比營收快 {r['ar_vs_revenue_gap']:.1f} 個百分點，留意收款狀況"))
+    if r.get("inv_vs_revenue_gap") is not None and r["inv_vs_revenue_gap"] > 10:
+        flags.append(("warn", f"存貨成長速度比營收快 {r['inv_vs_revenue_gap']:.1f} 個百分點，留意去化狀況"))
+
+    if r.get("gross_margin_delta") is not None:
+        if r["gross_margin_delta"] < -5:
+            flags.append(("warn", f"毛利率較上一期下滑 {abs(r['gross_margin_delta']):.1f} 個百分點，留意成本或定價壓力"))
+        elif r["gross_margin_delta"] > 8:
+            flags.append(("neutral", f"毛利率較上一期上升 {r['gross_margin_delta']:.1f} 個百分點，波動較大，建議了解原因"))
+    return flags
 
 
 def build_flags(r):
@@ -197,10 +255,6 @@ def build_flags(r):
             flags.append(("pos", f"營收年增 {fmt_pct(r['yoy'])}，成長強勁"))
         elif r["yoy"] < 0:
             flags.append(("warn", f"營收年增 {fmt_pct(r['yoy'])}，呈現衰退"))
-    if r.get("debt_ratio") is not None and r["debt_ratio"] > 60:
-        flags.append(("warn", f"負債比率偏高（{fmt_num(r['debt_ratio'])}%）"))
-    if r.get("cf_ratio") is not None and r["cf_ratio"] < 0.8:
-        flags.append(("warn", f"現金流／淨利比偏低（{r['cf_ratio']:.2f}）"))
     if r.get("roe") is not None and r["roe"] >= 15:
         flags.append(("pos", f"ROE {fmt_num(r['roe'])}%，股東權益報酬率不錯"))
     vr = r.get("vol_ratio_20") or r.get("vol_ratio_5")
@@ -250,6 +304,12 @@ def print_report(r):
             print(f"  · {text}")
     else:
         print("  · 尚無明顯訊號，或資料不足以判斷")
+
+    red_flags = build_red_flags(r)
+    if red_flags:
+        print("  [財報探測器]")
+        for tone, text in red_flags:
+            print(f"  ⚠ {text}")
 
 
 def esc(s):
@@ -309,6 +369,12 @@ def render_stock_card(r):
         for key, label, digits in DETAIL_FIELDS
     )
 
+    red_flags = build_red_flags(r)
+    red_flags_html = ""
+    if red_flags:
+        items = "".join(f'<div class="flag warn"><span>⚠</span><span>{esc(text)}</span></div>' for _, text in red_flags)
+        red_flags_html = f'<div class="redflag-box"><div class="redflag-title">財報探測器</div><div class="flags">{items}</div></div>'
+
     return f'''
     <div class="card">
       <div class="card-head">
@@ -318,6 +384,7 @@ def render_stock_card(r):
       {meta_html}
       {f'<div class="tiles">{tiles_html}</div>' if tiles_html else ""}
       <div class="flags">{flags_html}</div>
+      {red_flags_html}
       <details>
         <summary>完整數據</summary>
         <table>{rows}</table>
@@ -383,6 +450,8 @@ def render_html(reports, generated_at):
   .flag.pos{{background:var(--pos-soft);color:var(--pos);}}
   .flag.warn{{background:var(--warn-soft);color:var(--warn);}}
   .flag.neutral{{background:var(--neutral-soft);color:var(--muted);}}
+  .redflag-box{{border:1px dashed var(--warn);border-radius:12px;padding:10px 12px;margin-top:6px;margin-bottom:6px;}}
+  .redflag-title{{font-size:0.74rem;font-weight:700;color:var(--warn);margin-bottom:6px;}}
   details{{margin-top:8px;font-size:0.82rem;}}
   summary{{cursor:pointer;color:var(--pos);font-weight:600;}}
   table{{width:100%;border-collapse:collapse;margin-top:8px;font-size:0.82rem;}}
