@@ -389,6 +389,7 @@ def render_stock_card(r):
         <summary>完整數據</summary>
         <table>{rows}</table>
       </details>
+      <p class="more-link"><a href="analysis_{esc(r["code"])}.html">歷年財報深度分析 →</a></p>
     </div>
     '''
 
@@ -458,6 +459,9 @@ def render_html(reports, generated_at):
   td{{padding:4px 6px;border-bottom:1px solid var(--border);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}}
   td.l{{font-family:inherit;color:var(--muted);}}
   footer{{margin-top:12px;font-size:0.76rem;color:var(--muted);text-align:center;}}
+  .more-link{{margin:10px 0 0;font-size:0.82rem;}}
+  .more-link a{{color:var(--pos);text-decoration:none;font-weight:600;}}
+  .more-link a:hover{{text-decoration:underline;}}
   @media (max-width:480px){{ .tiles{{grid-template-columns:1fr;}} }}
 </style>
 </head>
@@ -473,6 +477,248 @@ def render_html(reports, generated_at):
 </html>'''
 
 
+def fetch_history_periods(code, today, years=8):
+    """抓多年財報+資產負債表，逐季組成時間序列，用來畫趨勢圖與杜邦ROE拆解。"""
+    start = (today - datetime.timedelta(days=years * 365)).isoformat()
+    fin_rows = safe_fetch("歷年損益表", "TaiwanStockFinancialStatements", code, start)
+    bal_rows = safe_fetch("歷年資產負債表", "TaiwanStockBalanceSheet", code, start)
+    fin_by_date = pivot_by_date(fin_rows)
+    bal_by_date = pivot_by_date(bal_rows)
+
+    periods = []
+    for date_str in sorted(fin_by_date.keys()):
+        f = fin_by_date[date_str]
+        b = bal_by_date.get(date_str, {})
+        revenue = f.get("Revenue")
+        net_income = f.get("IncomeAfterTaxes")
+        total_assets = b.get("TotalAssets")
+        equity_parent = b.get("EquityAttributableToOwnersOfParent")
+        p = {
+            "date": date_str,
+            "revenue": revenue,
+            "net_income": net_income,
+            "gross_margin": pct(f.get("GrossProfit"), revenue),
+            "op_margin": pct(f.get("OperatingIncome"), revenue),
+            "net_margin": pct(net_income, revenue),
+            "eps": f.get("EPS"),
+        }
+        if total_assets and equity_parent and revenue is not None and net_income is not None:
+            p["asset_turnover"] = revenue / total_assets
+            p["equity_multiplier"] = total_assets / equity_parent
+            p["roe"] = pct(net_income, equity_parent)
+        periods.append(p)
+    return periods
+
+
+def annual_aggregate(periods):
+    """把逐季資料依年度加總，算年度營收/淨利與年增率（簡化：直接加總各年已公布的季度）。"""
+    years = {}
+    for p in periods:
+        y = p["date"][:4]
+        yd = years.setdefault(y, {"revenue": 0, "net_income": 0, "quarters": 0, "has_rev": False, "has_ni": False})
+        if p.get("revenue") is not None:
+            yd["revenue"] += p["revenue"]
+            yd["has_rev"] = True
+        if p.get("net_income") is not None:
+            yd["net_income"] += p["net_income"]
+            yd["has_ni"] = True
+        yd["quarters"] += 1
+
+    sorted_keys = sorted(years.keys())
+    # 最早的一年如果季數不足 4 季，通常是抓取區間邊界造成的不完整年度，直接捨棄避免誤導
+    if len(sorted_keys) > 1 and years[sorted_keys[0]]["quarters"] < 4:
+        sorted_keys = sorted_keys[1:]
+
+    out = []
+    prev_rev = None
+    for y in sorted_keys:
+        d = years[y]
+        rev = d["revenue"] if d["has_rev"] else None
+        yoy = pct(rev - prev_rev, prev_rev) if (prev_rev and rev is not None) else None
+        out.append({
+            "year": y, "revenue": rev,
+            "net_income": d["net_income"] if d["has_ni"] else None,
+            "quarters": d["quarters"], "yoy": yoy,
+        })
+        if rev is not None:
+            prev_rev = rev
+    return out
+
+
+def render_analysis_page(code, name, periods, annual):
+    labels_q = [p["date"] for p in periods]
+    gross = [p.get("gross_margin") for p in periods]
+    op = [p.get("op_margin") for p in periods]
+    net = [p.get("net_margin") for p in periods]
+    roe = [p.get("roe") for p in periods]
+    asset_turnover = [p.get("asset_turnover") for p in periods]
+    equity_multiplier = [p.get("equity_multiplier") for p in periods]
+    net_margin_only = [p.get("net_margin") for p in periods]
+
+    labels_y = [a["year"] for a in annual]
+    rev_y = [a["revenue"] for a in annual]
+    ni_y = [a["net_income"] for a in annual]
+    yoy_y = [a["yoy"] for a in annual]
+
+    comp_rows = ""
+    if len(periods) >= 1:
+        latest = periods[-1]
+        prev_year = find_year_ago(
+            [(p["date"], p) for p in reversed(periods)], parse_date(latest["date"])
+        )
+        comp_fields = [
+            ("revenue", "營業收入", 0), ("gross_margin", "毛利率(%)", 1),
+            ("op_margin", "營業利益率(%)", 1), ("net_margin", "淨利率(%)", 1),
+            ("eps", "EPS", 2), ("roe", "ROE(%)", 1),
+        ]
+        for key, label, digits in comp_fields:
+            cur_v = latest.get(key)
+            prev_v = prev_year.get(key) if prev_year else None
+            delta = (cur_v - prev_v) if (cur_v is not None and prev_v is not None) else None
+            comp_rows += (
+                f'<tr><td class="l">{esc(label)}</td>'
+                f'<td>{esc(fmt_num(cur_v, digits))}</td>'
+                f'<td>{esc(fmt_num(prev_v, digits))}</td>'
+                f'<td class="{pct_class(delta)}">{esc(fmt_num(delta, digits)) if delta is not None else "—"}</td></tr>'
+            )
+
+    return f'''<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(name or code)} 財報深度分析</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root{{
+    --bg:#F3F5F8; --surface:#FFFFFF; --surface-muted:#EEF1F5; --border:#DCE2EA;
+    --ink:#131A26; --muted:#5B6576; --up:#D92B2B; --down:#1C8A4B; --pos:#0B5FAE;
+    --shadow: 0 1px 2px rgba(19,26,38,0.06), 0 10px 26px -14px rgba(19,26,38,0.20);
+  }}
+  @media (prefers-color-scheme: dark){{
+    :root{{
+      --bg:#0F1319; --surface:#171C24; --surface-muted:#1E2430; --border:#2B323E;
+      --ink:#E8EBF0; --muted:#8E97A6; --up:#F0605F; --down:#3FCB80; --pos:#5CA6E8;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 10px 26px -14px rgba(0,0,0,0.5);
+    }}
+  }}
+  *{{box-sizing:border-box;}}
+  body{{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"PingFang TC","Microsoft JhengHei",sans-serif;padding:32px 20px 56px;}}
+  .wrap{{max-width:900px;margin:0 auto;}}
+  a.back{{color:var(--pos);text-decoration:none;font-size:0.85rem;font-weight:600;}}
+  h1{{font-size:1.5rem;font-weight:700;margin:10px 0 4px;}}
+  .sub{{color:var(--muted);font-size:0.85rem;margin:0 0 18px;}}
+  .panel{{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px;margin-bottom:18px;box-shadow:var(--shadow);}}
+  .panel h2{{font-size:1.02rem;font-weight:700;margin:0 0 4px;}}
+  .panel .note{{font-size:0.76rem;color:var(--muted);margin:0 0 12px;}}
+  .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:16px;}}
+  canvas{{max-width:100%;}}
+  table{{width:100%;border-collapse:collapse;font-size:0.85rem;}}
+  td,th{{padding:6px 8px;border-bottom:1px solid var(--border);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-align:right;}}
+  th{{color:var(--muted);font-size:0.76rem;font-weight:600;}}
+  td.l,th.l{{font-family:inherit;text-align:left;color:var(--muted);}}
+  .up{{color:var(--up);}} .down{{color:var(--down);}}
+  footer{{margin-top:12px;font-size:0.76rem;color:var(--muted);text-align:center;}}
+  @media (max-width:640px){{ .grid2{{grid-template-columns:1fr;}} }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="report.html">← 回到每日追蹤報表</a>
+  <h1>{esc(name or "")} <span style="color:var(--muted);font-weight:400;">{esc(code)}</span></h1>
+  <p class="sub">歷年財報深度分析・資料來源 FinMind・僅供資料整理與描述，不構成投資建議</p>
+
+  <div class="panel">
+    <h2>年度營收與淨利</h2>
+    <p class="note">長條為各年度營收／淨利加總（取已公布季度加總，非完整年度的用虛線標示季數不足）；折線為營收年增率。</p>
+    <canvas id="chartAnnual" height="110"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2>三率趨勢（毛利率／營業利益率／淨利率）</h2>
+    <p class="note">近 {len(periods)} 季，單季數字。</p>
+    <canvas id="chartMargins" height="100"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2>杜邦 ROE 拆解</h2>
+    <p class="note">ROE = 淨利率 × 總資產週轉率 × 權益乘數（簡化版，用期末資產/權益，非平均值）。</p>
+    <div class="grid2">
+      <div><canvas id="chartRoe" height="140"></canvas></div>
+      <div><canvas id="chartTurnover" height="140"></canvas></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>本期 vs 去年同期</h2>
+    <table>
+      <tr><th class="l">項目</th><th>本期</th><th>去年同期</th><th>差異</th></tr>
+      {comp_rows}
+    </table>
+  </div>
+
+  <footer>資料來源：FinMind API，由本機 twse_watch.py 產生，不構成投資建議。</footer>
+</div>
+<script>
+  var labelsQ = {json.dumps(labels_q)};
+  var gross = {json.dumps(gross)};
+  var op = {json.dumps(op)};
+  var net = {json.dumps(net)};
+  var roe = {json.dumps(roe)};
+  var assetTurnover = {json.dumps(asset_turnover)};
+  var equityMultiplier = {json.dumps(equity_multiplier)};
+  var labelsY = {json.dumps(labels_y)};
+  var revY = {json.dumps(rev_y)};
+  var niY = {json.dumps(ni_y)};
+  var yoyY = {json.dumps(yoy_y)};
+
+  function baseOpts(extra){{
+    return Object.assign({{responsive:true, interaction:{{mode:'index',intersect:false}},
+      plugins:{{legend:{{labels:{{boxWidth:12}}}}}}}}, extra || {{}});
+  }}
+
+  new Chart(document.getElementById('chartAnnual'), {{
+    type: 'bar',
+    data: {{ labels: labelsY, datasets: [
+      {{ label:'年度營收', data: revY, backgroundColor:'#0B5FAE', yAxisID:'y' }},
+      {{ label:'年度淨利', data: niY, backgroundColor:'#8FB7DD', yAxisID:'y' }},
+      {{ label:'營收年增率(%)', data: yoyY, type:'line', borderColor:'#D92B2B', yAxisID:'y1', tension:0.25 }}
+    ]}},
+    options: baseOpts({{ scales:{{ y:{{position:'left'}}, y1:{{position:'right',grid:{{drawOnChartArea:false}}}} }} }})
+  }});
+
+  new Chart(document.getElementById('chartMargins'), {{
+    type: 'line',
+    data: {{ labels: labelsQ, datasets: [
+      {{ label:'毛利率%', data: gross, borderColor:'#0B5FAE', tension:0.2 }},
+      {{ label:'營業利益率%', data: op, borderColor:'#B45309', tension:0.2 }},
+      {{ label:'淨利率%', data: net, borderColor:'#1C8A4B', tension:0.2 }}
+    ]}},
+    options: baseOpts()
+  }});
+
+  new Chart(document.getElementById('chartRoe'), {{
+    type: 'line',
+    data: {{ labels: labelsQ, datasets: [
+      {{ label:'ROE%', data: roe, borderColor:'#0B5FAE', tension:0.2 }},
+      {{ label:'淨利率%', data: net, borderColor:'#8E97A6', tension:0.2, borderDash:[4,3] }}
+    ]}},
+    options: baseOpts()
+  }});
+
+  new Chart(document.getElementById('chartTurnover'), {{
+    type: 'line',
+    data: {{ labels: labelsQ, datasets: [
+      {{ label:'總資產週轉率(次)', data: assetTurnover, borderColor:'#0B5FAE', yAxisID:'y' }},
+      {{ label:'權益乘數(倍)', data: equityMultiplier, borderColor:'#B45309', yAxisID:'y1' }}
+    ]}},
+    options: baseOpts({{ scales:{{ y:{{position:'left'}}, y1:{{position:'right',grid:{{drawOnChartArea:false}}}} }} }})
+  }});
+</script>
+</body>
+</html>'''
+
+
 def main():
     today = datetime.date.today()
     print(f"=== 台股每日追蹤｜{today.isoformat()} ===")
@@ -484,6 +730,14 @@ def main():
         r = analyze_stock(code, today)
         reports.append(r)
         print_report(r)
+
+        print("  抓取歷年財報資料，產生深度分析頁面...")
+        periods = fetch_history_periods(code, today)
+        if periods:
+            annual = annual_aggregate(periods)
+            analysis_path = Path(__file__).parent / f"analysis_{code}.html"
+            analysis_path.write_text(render_analysis_page(code, r.get("name"), periods, annual), encoding="utf-8")
+            print(f"  → {analysis_path}")
 
     now = datetime.datetime.now()
     with LOG_FILE.open("a", encoding="utf-8") as f:

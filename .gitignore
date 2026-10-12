@@ -1,6 +1,7 @@
 log.jsonl
 history.json
 report.html
+analysis_*.html
 __pycache__/
 *.pyc
 .env
