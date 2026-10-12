@@ -36,7 +36,12 @@ pip install -r requirements.txt
 python3 twse_watch.py
 ```
 
-每次執行會把結果印在終端機，並附加記錄到本機的 `log.jsonl`（這個檔案已被 `.gitignore` 排除，不會被提交）。
+每次執行會：
+- 把結果印在終端機
+- 附加記錄到本機的 `log.jsonl`
+- 產生一份 `report.html` 網頁報表，並自動用瀏覽器打開（想關掉自動打開，把檔案開頭的 `OPEN_IN_BROWSER = True` 改成 `False`）
+
+`log.jsonl`、`report.html` 都已被 `.gitignore` 排除，不會被提交。
 
 可以用 cron（macOS/Linux）或工作排程器（Windows）設成每天自動跑一次，例如每個交易日下午 3 點：
 

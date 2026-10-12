@@ -18,6 +18,7 @@
 import json
 import os
 import datetime
+import webbrowser
 from pathlib import Path
 
 import requests
@@ -25,10 +26,14 @@ import requests
 # ---- 在這裡填入你要追蹤的股票代碼 ----
 WATCHLIST = ["2330", "2317", "2454"]
 
+# ---- 每次執行後是否自動用瀏覽器打開報表 ----
+OPEN_IN_BROWSER = True
+
 API = "https://api.finmindtrade.com/api/v4/data"
 TOKEN = os.environ.get("FINMIND_TOKEN", "")
 TIMEOUT = 20
 LOG_FILE = Path(__file__).parent / "log.jsonl"
+REPORT_FILE = Path(__file__).parent / "report.html"
 
 
 def fetch(dataset, data_id, start_date, end_date=None):
@@ -247,6 +252,158 @@ def print_report(r):
         print("  · 尚無明顯訊號，或資料不足以判斷")
 
 
+def esc(s):
+    if s is None:
+        return ""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def pct_class(v):
+    if v is None or v == 0:
+        return ""
+    return "up" if v > 0 else "down"
+
+
+DETAIL_FIELDS = [
+    ("date", "資料日期", None), ("close", "收盤價", 2), ("volume", "成交量", 0),
+    ("fin_period", "財報期間", None), ("revenue", "營業收入", 0),
+    ("gross_margin", "毛利率(%)", 1), ("op_margin", "營業利益率(%)", 1),
+    ("net_margin", "淨利率(%)", 1), ("eps", "EPS", 2), ("roe", "ROE(%)", 1),
+    ("debt_ratio", "負債比率(%)", 1), ("cf_ratio", "現金流/淨利比", 2),
+]
+
+
+def render_stock_card(r):
+    flags = build_flags(r)
+    flags_html = "".join(
+        f'<div class="flag {tone}"><span>—</span><span>{esc(text)}</span></div>'
+        for tone, text in flags
+    ) or '<div class="flag neutral"><span>—</span><span>尚無明顯訊號，或資料不足以判斷</span></div>'
+
+    if r.get("date"):
+        tiles_html = f'''
+          <div class="tile">
+            <div class="tlabel">財報｜營收年增</div>
+            <div class="tnum {pct_class(r.get('yoy'))}">{fmt_pct(r.get('yoy'))}</div>
+            <div class="tsub">ROE {fmt_pct(r.get('roe'))}・負債比 {fmt_pct(r.get('debt_ratio'))}</div>
+          </div>
+          <div class="tile">
+            <div class="tlabel">量｜量比(20日)</div>
+            <div class="tnum">{round(r['vol_ratio_20'], 2) if r.get('vol_ratio_20') is not None else "—"}</div>
+            <div class="tsub">今日量 {fmt_num(r.get('volume'), 0)}</div>
+          </div>
+          <div class="tile">
+            <div class="tlabel">價｜較前日</div>
+            <div class="tnum {pct_class(r.get('price_change_pct'))}">{fmt_pct(r.get('price_change_pct'))}</div>
+            <div class="tsub">年度區間位置 {fmt_pct(r.get('range_pos'), 0)}</div>
+          </div>
+        '''
+        meta_html = f'<div class="meta">{esc(r.get("date"))}　收盤 {fmt_num(r.get("close"), 2)}　財報期間 {esc(r.get("fin_period") or "—")}</div>'
+    else:
+        tiles_html = ""
+        meta_html = '<div class="meta">今日資料抓取失敗</div>'
+
+    rows = "".join(
+        f'<tr><td class="l">{esc(label)}</td><td>{esc(fmt_num(r.get(key), digits)) if digits is not None else esc(r.get(key) or "—")}</td></tr>'
+        for key, label, digits in DETAIL_FIELDS
+    )
+
+    return f'''
+    <div class="card">
+      <div class="card-head">
+        <span class="name">{esc(r.get("name") or "")}</span>
+        <span class="code">{esc(r["code"])}</span>
+      </div>
+      {meta_html}
+      {f'<div class="tiles">{tiles_html}</div>' if tiles_html else ""}
+      <div class="flags">{flags_html}</div>
+      <details>
+        <summary>完整數據</summary>
+        <table>{rows}</table>
+      </details>
+    </div>
+    '''
+
+
+def render_html(reports, generated_at):
+    cards = "".join(render_stock_card(r) for r in reports)
+    return f'''<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>台股每日追蹤報表</title>
+<style>
+  :root{{
+    --bg:#F3F5F8; --surface:#FFFFFF; --surface-muted:#EEF1F5; --border:#DCE2EA;
+    --ink:#131A26; --muted:#5B6576;
+    --up:#D92B2B; --down:#1C8A4B; --warn:#B45309; --pos:#0B5FAE;
+    --warn-soft:#FBF0DF; --pos-soft:#E3EEF9; --neutral-soft:#EEF1F5;
+    --shadow: 0 1px 2px rgba(19,26,38,0.06), 0 10px 26px -14px rgba(19,26,38,0.20);
+  }}
+  @media (prefers-color-scheme: dark){{
+    :root{{
+      --bg:#0F1319; --surface:#171C24; --surface-muted:#1E2430; --border:#2B323E;
+      --ink:#E8EBF0; --muted:#8E97A6;
+      --up:#F0605F; --down:#3FCB80; --warn:#E3A650; --pos:#5CA6E8;
+      --warn-soft:#3A2C16; --pos-soft:#1B2C3F; --neutral-soft:#1E2430;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 10px 26px -14px rgba(0,0,0,0.5);
+    }}
+  }}
+  *{{box-sizing:border-box;}}
+  body{{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang TC","Microsoft JhengHei",sans-serif;
+    padding:32px 20px 56px;
+  }}
+  .wrap{{max-width:800px;margin:0 auto;}}
+  h1{{font-size:1.6rem;font-weight:700;margin:0 0 4px;}}
+  .sub{{color:var(--muted);font-size:0.9rem;margin:0 0 18px;}}
+  .disclaimer{{
+    background:var(--surface-muted);border:1px solid var(--border);border-radius:12px;
+    padding:12px 14px;margin-bottom:22px;font-size:0.82rem;color:var(--muted);line-height:1.6;
+  }}
+  .card{{
+    background:var(--surface);border:1px solid var(--border);border-radius:16px;
+    padding:18px;margin-bottom:16px;box-shadow:var(--shadow);
+  }}
+  .card-head{{display:flex;align-items:baseline;gap:8px;margin-bottom:4px;}}
+  .name{{font-size:1.1rem;font-weight:700;}}
+  .code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);font-size:0.85rem;}}
+  .meta{{font-size:0.8rem;color:var(--muted);margin-bottom:12px;}}
+  .tiles{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px;}}
+  .tile{{background:var(--surface-muted);border:1px solid var(--border);border-radius:12px;padding:10px 12px;}}
+  .tlabel{{font-size:0.68rem;color:var(--muted);font-weight:600;margin-bottom:4px;}}
+  .tnum{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.05rem;font-weight:700;}}
+  .tsub{{font-size:0.7rem;color:var(--muted);margin-top:2px;}}
+  .up{{color:var(--up);}} .down{{color:var(--down);}}
+  .flags{{display:flex;flex-direction:column;gap:6px;margin-bottom:6px;}}
+  .flag{{display:flex;gap:6px;font-size:0.82rem;padding:6px 10px;border-radius:9px;}}
+  .flag.pos{{background:var(--pos-soft);color:var(--pos);}}
+  .flag.warn{{background:var(--warn-soft);color:var(--warn);}}
+  .flag.neutral{{background:var(--neutral-soft);color:var(--muted);}}
+  details{{margin-top:8px;font-size:0.82rem;}}
+  summary{{cursor:pointer;color:var(--pos);font-weight:600;}}
+  table{{width:100%;border-collapse:collapse;margin-top:8px;font-size:0.82rem;}}
+  td{{padding:4px 6px;border-bottom:1px solid var(--border);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}}
+  td.l{{font-family:inherit;color:var(--muted);}}
+  footer{{margin-top:12px;font-size:0.76rem;color:var(--muted);text-align:center;}}
+  @media (max-width:480px){{ .tiles{{grid-template-columns:1fr;}} }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>台股每日追蹤報表</h1>
+    <p class="sub">產生時間：{esc(generated_at)}</p>
+    <div class="disclaimer">這份報表只做資料整理與描述，不構成投資建議，請自行核對公開資訊並謹慎判斷。</div>
+    {cards}
+    <footer>資料來源：FinMind API，由本機 twse_watch.py 產生。</footer>
+  </div>
+</body>
+</html>'''
+
+
 def main():
     today = datetime.date.today()
     print(f"=== 台股每日追蹤｜{today.isoformat()} ===")
@@ -259,9 +416,16 @@ def main():
         reports.append(r)
         print_report(r)
 
+    now = datetime.datetime.now()
     with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"run_at": datetime.datetime.now().isoformat(), "reports": reports}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"run_at": now.isoformat(), "reports": reports}, ensure_ascii=False) + "\n")
     print(f"\n本次結果已附加記錄到 {LOG_FILE}")
+
+    REPORT_FILE.write_text(render_html(reports, now.strftime("%Y-%m-%d %H:%M")), encoding="utf-8")
+    print(f"HTML 報表已產生：{REPORT_FILE}")
+    if OPEN_IN_BROWSER:
+        webbrowser.open(REPORT_FILE.as_uri())
+
     print("（這個工具只整理資料，不構成投資建議，請自行核對公開資訊並謹慎判斷）")
 
 
