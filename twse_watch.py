@@ -477,37 +477,165 @@ def render_html(reports, generated_at):
 </html>'''
 
 
+QUARTER_DAYS = 91  # 簡化：用 91 天代表一季，不是精確日曆天數
+
+
 def fetch_history_periods(code, today, years=8):
-    """抓多年財報+資產負債表，逐季組成時間序列，用來畫趨勢圖與杜邦ROE拆解。"""
+    """抓多年財報＋資產負債表＋現金流量表，逐季組成時間序列，
+    用來畫趨勢圖、杜邦ROE拆解，以及健診用的現金流/應收/存貨數字。"""
     start = (today - datetime.timedelta(days=years * 365)).isoformat()
     fin_rows = safe_fetch("歷年損益表", "TaiwanStockFinancialStatements", code, start)
     bal_rows = safe_fetch("歷年資產負債表", "TaiwanStockBalanceSheet", code, start)
+    cf_rows = safe_fetch("歷年現金流量表", "TaiwanStockCashFlowsStatement", code, start)
     fin_by_date = pivot_by_date(fin_rows)
     bal_by_date = pivot_by_date(bal_rows)
+    cf_by_date = pivot_by_date(cf_rows)
 
     periods = []
     for date_str in sorted(fin_by_date.keys()):
         f = fin_by_date[date_str]
         b = bal_by_date.get(date_str, {})
+        c = cf_by_date.get(date_str, {})
         revenue = f.get("Revenue")
+        cogs = f.get("CostOfGoodsSold")
+        gross_profit = f.get("GrossProfit")
+        op_income = f.get("OperatingIncome")
+        pretax_income = f.get("PreTaxIncome")
         net_income = f.get("IncomeAfterTaxes")
         total_assets = b.get("TotalAssets")
         equity_parent = b.get("EquityAttributableToOwnersOfParent")
+        ar = b.get("AccountsReceivableNet")
+        inventory = b.get("Inventories")
+        cfo = c.get("NetCashInflowFromOperatingActivities")
+        capex = c.get("PropertyAndPlantAndEquipment")  # 投資活動的資本支出，本身已是負值
+
         p = {
             "date": date_str,
             "revenue": revenue,
+            "gross_profit": gross_profit,
+            "op_income": op_income,
+            "pretax_income": pretax_income,
             "net_income": net_income,
-            "gross_margin": pct(f.get("GrossProfit"), revenue),
-            "op_margin": pct(f.get("OperatingIncome"), revenue),
+            "gross_margin": pct(gross_profit, revenue),
+            "op_margin": pct(op_income, revenue),
             "net_margin": pct(net_income, revenue),
             "eps": f.get("EPS"),
+            "ar": ar, "inventory": inventory,
+            "cfo": cfo, "capex": capex,
+            "fcf": (cfo + capex) if (cfo is not None and capex is not None) else None,
         }
+        if ar is not None and revenue:
+            p["ar_days"] = ar / revenue * QUARTER_DAYS
+        if inventory is not None and cogs:
+            p["inv_days"] = inventory / cogs * QUARTER_DAYS
         if total_assets and equity_parent and revenue is not None and net_income is not None:
             p["asset_turnover"] = revenue / total_assets
             p["equity_multiplier"] = total_assets / equity_parent
             p["roe"] = pct(net_income, equity_parent)
         periods.append(p)
     return periods
+
+
+def complete_years(periods):
+    """只保留剛好有 4 季資料的完整年度，用於健診的『近5年』統計。"""
+    years = {}
+    for p in periods:
+        y = p["date"][:4]
+        yd = years.setdefault(y, {"revenue": 0, "net_income": 0, "cfo": 0, "capex": 0, "quarters": 0, "ok": True})
+        for key in ("revenue", "net_income", "cfo", "capex"):
+            v = p.get(key)
+            if v is None:
+                yd["ok"] = False
+            else:
+                yd[key] += v
+        yd["quarters"] += 1
+
+    out = []
+    for y in sorted(years.keys()):
+        d = years[y]
+        if d["quarters"] == 4 and d["ok"]:
+            out.append({
+                "year": y, "revenue": d["revenue"], "net_income": d["net_income"],
+                "cfo": d["cfo"], "fcf": d["cfo"] + d["capex"],
+                "cfo_ratio": (d["cfo"] / d["net_income"]) if d["net_income"] else None,
+            })
+    return out
+
+
+def red_flag_health_check(periods):
+    """地雷股健診：參考財報狗公開的 6 項檢查邏輯，只做描述，不是投資建議。"""
+    items = []
+    years = complete_years(periods)[-5:]
+    if years:
+        fcf_vals = [y["fcf"] for y in years if y["fcf"] is not None]
+        fcf_pos = sum(1 for v in fcf_vals if v > 0)
+        items.append(("自由現金流近5年至少3年為正", fcf_pos >= 3, f"{fcf_pos}/{len(years)} 年為正"))
+        if fcf_vals:
+            avg_fcf = sum(fcf_vals) / len(fcf_vals)
+            items.append(("自由現金流5年平均為正", avg_fcf > 0, fmt_num(avg_fcf, 0)))
+
+        ratios = [y["cfo_ratio"] for y in years if y["cfo_ratio"] is not None]
+        ratio_ok = sum(1 for v in ratios if v > 1.0)
+        items.append(("營業現金流/淨利近5年至少3年>100%", ratio_ok >= 3, f"{ratio_ok}/{len(years)} 年>100%"))
+        if ratios:
+            avg_ratio = sum(ratios) / len(ratios)
+            items.append(("營業現金流/淨利5年平均>100%", avg_ratio > 1.0, fmt_pct(avg_ratio * 100)))
+    else:
+        items.append(("自由現金流 / 現金流對淨利比（近5年）", None, "完整年度資料不足"))
+
+    if periods:
+        latest = periods[-1]
+        prev_year = find_year_ago([(p["date"], p) for p in reversed(periods)], parse_date(latest["date"]))
+        if prev_year and latest.get("ar_days") is not None and prev_year.get("ar_days") is not None:
+            ok = latest["ar_days"] <= prev_year["ar_days"]
+            items.append(("應收帳款週轉天數 ≤ 去年同期", ok, f"{latest['ar_days']:.1f} 天 vs 去年 {prev_year['ar_days']:.1f} 天"))
+        else:
+            items.append(("應收帳款週轉天數 ≤ 去年同期", None, "資料不足"))
+        if prev_year and latest.get("inv_days") is not None and prev_year.get("inv_days") is not None:
+            ok = latest["inv_days"] <= prev_year["inv_days"]
+            items.append(("存貨週轉天數 ≤ 去年同期", ok, f"{latest['inv_days']:.1f} 天 vs 去年 {prev_year['inv_days']:.1f} 天"))
+        else:
+            items.append(("存貨週轉天數 ≤ 去年同期", None, "資料不足"))
+    return items
+
+
+def growth_health_check(code, periods, today):
+    """成長股健診：參考財報狗公開的 5 項檢查邏輯，只做描述，不是投資建議。"""
+    items = []
+    rows = safe_fetch("月營收", "TaiwanStockMonthRevenue", code, (today - datetime.timedelta(days=800)).isoformat())
+    monthly = sorted(rows, key=lambda r: (r["revenue_year"], r["revenue_month"]))
+    by_ym = {(r["revenue_year"], r["revenue_month"]): r["revenue"] for r in monthly}
+    yoy_list = []
+    for r in monthly:
+        y, m = r["revenue_year"], r["revenue_month"]
+        prev = by_ym.get((y - 1, m))
+        if prev:
+            yoy_list.append((f"{y}/{m:02d}", pct(r["revenue"] - prev, prev)))
+    last3 = yoy_list[-3:]
+    if len(last3) == 3:
+        ok = all(v is not None and v > 0 for _, v in last3)
+        detail = "、".join(f"{label} {fmt_pct(v)}" for label, v in last3)
+        items.append(("月營收年增率連續3個月>0", ok, detail))
+    else:
+        items.append(("月營收年增率連續3個月>0", None, "資料不足"))
+
+    if periods:
+        latest = periods[-1]
+        prev_year = find_year_ago([(p["date"], p) for p in reversed(periods)], parse_date(latest["date"]))
+        checks = [
+            ("gross_profit", "毛利年增率>0（本期 vs 去年同期）"),
+            ("op_income", "營業利益年增率>0（本期 vs 去年同期）"),
+            ("pretax_income", "稅前淨利年增率>0（本期 vs 去年同期）"),
+            ("net_income", "稅後淨利年增率>0（本期 vs 去年同期）"),
+        ]
+        for key, label in checks:
+            cur, prv = latest.get(key), (prev_year.get(key) if prev_year else None)
+            if cur is not None and prv:
+                yoy = pct(cur - prv, prv)
+                items.append((label, yoy > 0, fmt_pct(yoy)))
+            else:
+                items.append((label, None, "資料不足"))
+    return items
 
 
 def annual_aggregate(periods):
@@ -545,7 +673,28 @@ def annual_aggregate(periods):
     return out
 
 
-def render_analysis_page(code, name, periods, annual):
+def render_health_panel(title, items):
+    if not items:
+        return ""
+    passed = sum(1 for _, ok, _ in items if ok is True)
+    determinable = sum(1 for _, ok, _ in items if ok is not None)
+    rows = "".join(
+        f'<tr><td class="l">{esc(label)}</td>'
+        f'<td class="hc-mark {"ok" if ok is True else ("no" if ok is False else "unk")}">'
+        f'{"✓" if ok is True else ("✗" if ok is False else "—")}</td>'
+        f'<td class="hc-detail">{esc(detail)}</td></tr>'
+        for label, ok, detail in items
+    )
+    return f'''
+    <div class="hc-card">
+      <div class="hc-head"><span class="hc-title">{esc(title)}</span>
+        <span class="hc-score">{passed} / {determinable or len(items)} 項通過</span></div>
+      <table class="hc-table">{rows}</table>
+    </div>
+    '''
+
+
+def render_analysis_page(code, name, periods, annual, red_flag_items, growth_items):
     labels_q = [p["date"] for p in periods]
     gross = [p.get("gross_margin") for p in periods]
     op = [p.get("op_margin") for p in periods]
@@ -593,12 +742,14 @@ def render_analysis_page(code, name, periods, annual):
   :root{{
     --bg:#F3F5F8; --surface:#FFFFFF; --surface-muted:#EEF1F5; --border:#DCE2EA;
     --ink:#131A26; --muted:#5B6576; --up:#D92B2B; --down:#1C8A4B; --pos:#0B5FAE;
+    --good:#1C8A4B; --bad:#D92B2B;
     --shadow: 0 1px 2px rgba(19,26,38,0.06), 0 10px 26px -14px rgba(19,26,38,0.20);
   }}
   @media (prefers-color-scheme: dark){{
     :root{{
       --bg:#0F1319; --surface:#171C24; --surface-muted:#1E2430; --border:#2B323E;
       --ink:#E8EBF0; --muted:#8E97A6; --up:#F0605F; --down:#3FCB80; --pos:#5CA6E8;
+      --good:#3FCB80; --bad:#F0605F;
       --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 10px 26px -14px rgba(0,0,0,0.5);
     }}
   }}
@@ -618,8 +769,19 @@ def render_analysis_page(code, name, periods, annual):
   th{{color:var(--muted);font-size:0.76rem;font-weight:600;}}
   td.l,th.l{{font-family:inherit;text-align:left;color:var(--muted);}}
   .up{{color:var(--up);}} .down{{color:var(--down);}}
+  .hc-grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;}}
+  .hc-card{{background:var(--surface-muted);border:1px solid var(--border);border-radius:12px;padding:12px 14px;}}
+  .hc-head{{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;}}
+  .hc-title{{font-size:0.88rem;font-weight:700;}}
+  .hc-score{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.8rem;color:var(--muted);}}
+  .hc-table{{font-size:0.76rem;}}
+  .hc-table td{{padding:5px 4px;}}
+  .hc-table td.l{{text-align:left;width:52%;}}
+  .hc-mark{{text-align:center;font-weight:700;width:10%;font-family:inherit;}}
+  .hc-mark.ok{{color:var(--good);}} .hc-mark.no{{color:var(--bad);}} .hc-mark.unk{{color:var(--muted);}}
+  .hc-detail{{text-align:left;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}}
   footer{{margin-top:12px;font-size:0.76rem;color:var(--muted);text-align:center;}}
-  @media (max-width:640px){{ .grid2{{grid-template-columns:1fr;}} }}
+  @media (max-width:640px){{ .grid2{{grid-template-columns:1fr;}} .hc-grid{{grid-template-columns:1fr;}} }}
 </style>
 </head>
 <body>
@@ -627,6 +789,15 @@ def render_analysis_page(code, name, periods, annual):
   <a class="back" href="report.html">← 回到每日追蹤報表</a>
   <h1>{esc(name or "")} <span style="color:var(--muted);font-weight:400;">{esc(code)}</span></h1>
   <p class="sub">歷年財報深度分析・資料來源 FinMind・僅供資料整理與描述，不構成投資建議</p>
+
+  <div class="panel">
+    <h2>個股健診</h2>
+    <p class="note">參考財報狗公開說明的健診邏輯重新計算，評分制、只做條件檢查，<strong>不是投資建議</strong>，各項門檻為常見經驗法則，不是絕對標準。</p>
+    <div class="hc-grid">
+      {render_health_panel("地雷股健診（避雷）", red_flag_items)}
+      {render_health_panel("成長股健診", growth_items)}
+    </div>
+  </div>
 
   <div class="panel">
     <h2>年度營收與淨利</h2>
@@ -735,8 +906,13 @@ def main():
         periods = fetch_history_periods(code, today)
         if periods:
             annual = annual_aggregate(periods)
+            red_flag_items = red_flag_health_check(periods)
+            growth_items = growth_health_check(code, periods, today)
             analysis_path = Path(__file__).parent / f"analysis_{code}.html"
-            analysis_path.write_text(render_analysis_page(code, r.get("name"), periods, annual), encoding="utf-8")
+            analysis_path.write_text(
+                render_analysis_page(code, r.get("name"), periods, annual, red_flag_items, growth_items),
+                encoding="utf-8",
+            )
             print(f"  → {analysis_path}")
 
     now = datetime.datetime.now()
