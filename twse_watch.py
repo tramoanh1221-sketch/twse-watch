@@ -646,6 +646,7 @@ def calc_kd(highs, lows, closes, window=9):
 
 def compute_technical(price_rows):
     dates = [r["date"] for r in price_rows]
+    opens = [r.get("open") for r in price_rows]
     closes = [r.get("close") for r in price_rows]
     highs = [r.get("max") for r in price_rows]
     lows = [r.get("min") for r in price_rows]
@@ -653,7 +654,7 @@ def compute_technical(price_rows):
     macd_line, signal_line, hist = calc_macd(closes)
     k_line, d_line = calc_kd(highs, lows, closes)
     return {
-        "dates": dates, "close": closes, "volume": volumes,
+        "dates": dates, "open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes,
         "ma5": sma(closes, 5), "ma10": sma(closes, 10), "ma20": sma(closes, 20), "ma60": sma(closes, 60),
         "rsi": calc_rsi(closes, 14),
         "macd": macd_line, "signal": signal_line, "hist": hist,
@@ -863,6 +864,7 @@ def render_analysis_page(code, name, periods, annual, red_flag_items, growth_ite
   .panel .note{{font-size:0.76rem;color:var(--muted);margin:0 0 12px;}}
   .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:16px;}}
   canvas{{max-width:100%;}}
+  canvas.hand-canvas{{display:block;width:100%;}}
   table{{width:100%;border-collapse:collapse;font-size:0.85rem;}}
   td,th{{padding:6px 8px;border-bottom:1px solid var(--border);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-align:right;}}
   th{{color:var(--muted);font-size:0.76rem;font-weight:600;}}
@@ -896,6 +898,12 @@ def render_analysis_page(code, name, periods, annual, red_flag_items, growth_ite
       {render_health_panel("地雷股健診（避雷）", red_flag_items)}
       {render_health_panel("成長股健診", growth_items)}
     </div>
+  </div>
+
+  <div class="panel">
+    <h2>K 線圖（近 120 日）</h2>
+    <p class="note">紅漲綠跌（台股慣例），疊加 MA5（紅細線）／MA20（藍細線）。</p>
+    <canvas id="chartCandle" class="hand-canvas" data-height="280"></canvas>
   </div>
 
   <div class="panel">
@@ -961,6 +969,9 @@ def render_analysis_page(code, name, periods, annual, red_flag_items, growth_ite
   var yoyY = {json.dumps(yoy_y)};
 
   var tDates = {json.dumps(tech["dates"])};
+  var tOpen = {json.dumps(tech["open"])};
+  var tHigh = {json.dumps(tech["high"])};
+  var tLow = {json.dumps(tech["low"])};
   var tClose = {json.dumps(tech["close"])};
   var tVolume = {json.dumps(tech["volume"])};
   var tMa5 = {json.dumps(tech["ma5"])};
@@ -1018,6 +1029,100 @@ def render_analysis_page(code, name, periods, annual, red_flag_items, growth_ite
   }});
 
   var tOpts = baseOpts({{ elements:{{point:{{radius:0}}}}, scales:{{ x:{{ticks:{{maxTicksLimit:10}}}} }} }});
+
+  function drawCandles(canvasId, dates, opens, highs, lows, closes, ma5, ma20){{
+    var canvas = document.getElementById(canvasId);
+    var dpr = window.devicePixelRatio || 1;
+    var cssWidth = canvas.parentElement.clientWidth;
+    var cssHeight = parseInt(canvas.dataset.height || '260', 10);
+    canvas.style.width = cssWidth + 'px';
+    canvas.style.height = cssHeight + 'px';
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    var ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+    var n = dates.length;
+    if (n === 0) return;
+    var pad = {{top: 10, right: 54, bottom: 20, left: 6}};
+    var plotW = cssWidth - pad.left - pad.right;
+    var plotH = cssHeight - pad.top - pad.bottom;
+
+    var validHighs = highs.filter(function(v){{ return v != null; }});
+    var validLows = lows.filter(function(v){{ return v != null; }});
+    if (!validHighs.length || !validLows.length) return;
+    var maxV = Math.max.apply(null, validHighs);
+    var minV = Math.min.apply(null, validLows);
+    var range = (maxV - minV) || 1;
+    function yFor(v){{ return pad.top + (maxV - v) / range * plotH; }}
+
+    var cssVars = getComputedStyle(document.documentElement);
+    var upColor = cssVars.getPropertyValue('--up').trim() || '#D92B2B';
+    var downColor = cssVars.getPropertyValue('--down').trim() || '#1C8A4B';
+    var gridColor = cssVars.getPropertyValue('--border').trim() || '#DCE2EA';
+    var textColor = cssVars.getPropertyValue('--muted').trim() || '#5B6576';
+
+    ctx.font = '11px -apple-system,sans-serif';
+    ctx.strokeStyle = gridColor;
+    ctx.fillStyle = textColor;
+    ctx.lineWidth = 1;
+    var ticks = 5;
+    for (var t = 0; t <= ticks; t++){{
+      var val = minV + range * t / ticks;
+      var y = yFor(val);
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+      ctx.fillText(val.toFixed(1), pad.left + plotW + 4, y + 3);
+    }}
+
+    var slot = plotW / n;
+    var bodyW = Math.max(1, slot * 0.62);
+    for (var i = 0; i < n; i++){{
+      if (opens[i] == null || closes[i] == null || highs[i] == null || lows[i] == null) continue;
+      var x = pad.left + i * slot + slot / 2;
+      var up = closes[i] >= opens[i];
+      var color = up ? upColor : downColor;
+      ctx.strokeStyle = color; ctx.fillStyle = color;
+      ctx.beginPath(); ctx.moveTo(x, yFor(highs[i])); ctx.lineTo(x, yFor(lows[i])); ctx.stroke();
+      var yO = yFor(opens[i]), yC = yFor(closes[i]);
+      var top = Math.min(yO, yC), h = Math.max(1, Math.abs(yC - yO));
+      ctx.fillRect(x - bodyW / 2, top, bodyW, h);
+    }}
+
+    function drawLine(values, color){{
+      ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.beginPath();
+      var started = false;
+      for (var i = 0; i < n; i++){{
+        if (values[i] == null){{ started = false; continue; }}
+        var x = pad.left + i * slot + slot / 2, y = yFor(values[i]);
+        if (!started){{ ctx.moveTo(x, y); started = true; }} else {{ ctx.lineTo(x, y); }}
+      }}
+      ctx.stroke();
+    }}
+    drawLine(ma5, upColor);
+    drawLine(ma20, '#0B5FAE');
+
+    ctx.fillStyle = textColor;
+    var labelCount = Math.min(6, n);
+    for (var li = 0; li < labelCount; li++){{
+      var idx = labelCount > 1 ? Math.floor(li * (n - 1) / (labelCount - 1)) : 0;
+      var lx = pad.left + idx * slot + slot / 2;
+      ctx.fillText(dates[idx].slice(5), lx - 15, cssHeight - 4);
+    }}
+  }}
+
+  function renderCandleChart(){{
+    var N = 120;
+    drawCandles('chartCandle',
+      tDates.slice(-N), tOpen.slice(-N), tHigh.slice(-N), tLow.slice(-N), tClose.slice(-N),
+      tMa5.slice(-N), tMa20.slice(-N));
+  }}
+  renderCandleChart();
+  var candleResizeTimer = null;
+  window.addEventListener('resize', function(){{
+    clearTimeout(candleResizeTimer);
+    candleResizeTimer = setTimeout(renderCandleChart, 150);
+  }});
 
   new Chart(document.getElementById('chartPrice'), {{
     type: 'line',
