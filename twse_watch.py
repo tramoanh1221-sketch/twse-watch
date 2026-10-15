@@ -562,6 +562,105 @@ def complete_years(periods):
     return out
 
 
+# ---- 技術面指標（股價、均線、RSI、MACD、KD） ----
+
+def fetch_price_series(code, today, days=730):
+    rows = safe_fetch("日線股價", "TaiwanStockPrice", code, (today - datetime.timedelta(days=days)).isoformat())
+    return sorted(rows, key=lambda r: r["date"])
+
+
+def sma(values, window):
+    out = [None] * len(values)
+    for i in range(len(values)):
+        if i + 1 < window:
+            continue
+        chunk = values[i + 1 - window:i + 1]
+        if any(v is None for v in chunk):
+            continue
+        out[i] = sum(chunk) / window
+    return out
+
+
+def ema(values, window):
+    out = [None] * len(values)
+    k = 2 / (window + 1)
+    prev = None
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        prev = v if prev is None else (v * k + prev * (1 - k))
+        out[i] = prev
+    return out
+
+
+def calc_rsi(closes, window=14):
+    n = len(closes)
+    out = [None] * n
+    changes = [None] * n
+    for i in range(1, n):
+        if closes[i] is not None and closes[i - 1] is not None:
+            changes[i] = closes[i] - closes[i - 1]
+    for i in range(window, n):
+        chunk = changes[i - window + 1:i + 1]
+        if any(c is None for c in chunk):
+            continue
+        gains = [c for c in chunk if c > 0]
+        losses = [-c for c in chunk if c < 0]
+        avg_gain = sum(gains) / window
+        avg_loss = sum(losses) / window
+        out[i] = 100.0 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
+    return out
+
+
+def calc_macd(closes, fast=12, slow=26, signal=9):
+    ema_fast, ema_slow = ema(closes, fast), ema(closes, slow)
+    macd_line = [(f - s) if (f is not None and s is not None) else None for f, s in zip(ema_fast, ema_slow)]
+    signal_line = ema(macd_line, signal)
+    hist = [(m - s) if (m is not None and s is not None) else None for m, s in zip(macd_line, signal_line)]
+    return macd_line, signal_line, hist
+
+
+def calc_kd(highs, lows, closes, window=9):
+    n = len(closes)
+    rsv = [None] * n
+    for i in range(window - 1, n):
+        h, l = highs[i - window + 1:i + 1], lows[i - window + 1:i + 1]
+        if any(x is None for x in h) or any(x is None for x in l) or closes[i] is None:
+            continue
+        hh, ll = max(h), min(l)
+        rsv[i] = 50.0 if hh == ll else (closes[i] - ll) / (hh - ll) * 100
+
+    k_line, d_line = [None] * n, [None] * n
+    k_prev = d_prev = None
+    for i in range(n):
+        if rsv[i] is None:
+            continue
+        if k_prev is None:
+            k_prev = d_prev = rsv[i]
+        else:
+            k_prev = k_prev * 2 / 3 + rsv[i] * 1 / 3
+            d_prev = d_prev * 2 / 3 + k_prev * 1 / 3
+        k_line[i], d_line[i] = k_prev, d_prev
+    return k_line, d_line
+
+
+def compute_technical(price_rows):
+    dates = [r["date"] for r in price_rows]
+    closes = [r.get("close") for r in price_rows]
+    highs = [r.get("max") for r in price_rows]
+    lows = [r.get("min") for r in price_rows]
+    volumes = [r.get("Trading_Volume") for r in price_rows]
+    macd_line, signal_line, hist = calc_macd(closes)
+    k_line, d_line = calc_kd(highs, lows, closes)
+    return {
+        "dates": dates, "close": closes, "volume": volumes,
+        "ma5": sma(closes, 5), "ma10": sma(closes, 10), "ma20": sma(closes, 20), "ma60": sma(closes, 60),
+        "rsi": calc_rsi(closes, 14),
+        "macd": macd_line, "signal": signal_line, "hist": hist,
+        "k": k_line, "d": d_line,
+    }
+
+
 def red_flag_health_check(periods):
     """地雷股健診：參考財報狗公開的 6 項檢查邏輯，只做描述，不是投資建議。"""
     items = []
@@ -694,7 +793,7 @@ def render_health_panel(title, items):
     '''
 
 
-def render_analysis_page(code, name, periods, annual, red_flag_items, growth_items):
+def render_analysis_page(code, name, periods, annual, red_flag_items, growth_items, tech):
     labels_q = [p["date"] for p in periods]
     gross = [p.get("gross_margin") for p in periods]
     op = [p.get("op_margin") for p in periods]
@@ -800,6 +899,24 @@ def render_analysis_page(code, name, periods, annual, red_flag_items, growth_ite
   </div>
 
   <div class="panel">
+    <h2>股價走勢</h2>
+    <p class="note">近 {len(tech["dates"])} 個交易日收盤價，疊加 MA5／MA20／MA60 均線。</p>
+    <canvas id="chartPrice" height="130"></canvas>
+    <canvas id="chartVolume" height="50"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2>技術面指標</h2>
+    <p class="note">RSI14、MACD(12,26,9)、KD(9)，計算方式為常見簡化版，僅供參考，不是買賣訊號。</p>
+    <p class="note" style="margin-top:-6px;">RSI</p>
+    <canvas id="chartRsi" height="60"></canvas>
+    <p class="note" style="margin-top:14px;">MACD</p>
+    <canvas id="chartMacd" height="70"></canvas>
+    <p class="note" style="margin-top:14px;">KD</p>
+    <canvas id="chartKd" height="60"></canvas>
+  </div>
+
+  <div class="panel">
     <h2>年度營收與淨利</h2>
     <p class="note">長條為各年度營收／淨利加總（取已公布季度加總，非完整年度的用虛線標示季數不足）；折線為營收年增率。</p>
     <canvas id="chartAnnual" height="110"></canvas>
@@ -843,6 +960,20 @@ def render_analysis_page(code, name, periods, annual, red_flag_items, growth_ite
   var niY = {json.dumps(ni_y)};
   var yoyY = {json.dumps(yoy_y)};
 
+  var tDates = {json.dumps(tech["dates"])};
+  var tClose = {json.dumps(tech["close"])};
+  var tVolume = {json.dumps(tech["volume"])};
+  var tMa5 = {json.dumps(tech["ma5"])};
+  var tMa10 = {json.dumps(tech["ma10"])};
+  var tMa20 = {json.dumps(tech["ma20"])};
+  var tMa60 = {json.dumps(tech["ma60"])};
+  var tRsi = {json.dumps(tech["rsi"])};
+  var tMacd = {json.dumps(tech["macd"])};
+  var tSignal = {json.dumps(tech["signal"])};
+  var tHist = {json.dumps(tech["hist"])};
+  var tK = {json.dumps(tech["k"])};
+  var tD = {json.dumps(tech["d"])};
+
   function baseOpts(extra){{
     return Object.assign({{responsive:true, interaction:{{mode:'index',intersect:false}},
       plugins:{{legend:{{labels:{{boxWidth:12}}}}}}}}, extra || {{}});
@@ -885,6 +1016,54 @@ def render_analysis_page(code, name, periods, annual, red_flag_items, growth_ite
     ]}},
     options: baseOpts({{ scales:{{ y:{{position:'left'}}, y1:{{position:'right',grid:{{drawOnChartArea:false}}}} }} }})
   }});
+
+  var tOpts = baseOpts({{ elements:{{point:{{radius:0}}}}, scales:{{ x:{{ticks:{{maxTicksLimit:10}}}} }} }});
+
+  new Chart(document.getElementById('chartPrice'), {{
+    type: 'line',
+    data: {{ labels: tDates, datasets: [
+      {{ label:'收盤價', data: tClose, borderColor:'#131A26', borderWidth:1.6 }},
+      {{ label:'MA5', data: tMa5, borderColor:'#D92B2B', borderWidth:1 }},
+      {{ label:'MA20', data: tMa20, borderColor:'#0B5FAE', borderWidth:1 }},
+      {{ label:'MA60', data: tMa60, borderColor:'#B45309', borderWidth:1 }}
+    ]}},
+    options: tOpts
+  }});
+
+  new Chart(document.getElementById('chartVolume'), {{
+    type: 'bar',
+    data: {{ labels: tDates, datasets: [
+      {{ label:'成交量', data: tVolume, backgroundColor:'#8E97A6' }}
+    ]}},
+    options: Object.assign({{}}, tOpts, {{ plugins:{{legend:{{display:false}}}} }})
+  }});
+
+  new Chart(document.getElementById('chartRsi'), {{
+    type: 'line',
+    data: {{ labels: tDates, datasets: [
+      {{ label:'RSI14', data: tRsi, borderColor:'#0B5FAE', borderWidth:1.3 }}
+    ]}},
+    options: Object.assign({{}}, tOpts, {{ scales:{{ y:{{min:0,max:100}}, x:tOpts.scales.x }} }})
+  }});
+
+  new Chart(document.getElementById('chartMacd'), {{
+    type: 'bar',
+    data: {{ labels: tDates, datasets: [
+      {{ type:'bar', label:'柱狀', data: tHist, backgroundColor:'#C9D3DE' }},
+      {{ type:'line', label:'MACD', data: tMacd, borderColor:'#0B5FAE', borderWidth:1.2 }},
+      {{ type:'line', label:'訊號線', data: tSignal, borderColor:'#D92B2B', borderWidth:1.2 }}
+    ]}},
+    options: tOpts
+  }});
+
+  new Chart(document.getElementById('chartKd'), {{
+    type: 'line',
+    data: {{ labels: tDates, datasets: [
+      {{ label:'K', data: tK, borderColor:'#0B5FAE', borderWidth:1.3 }},
+      {{ label:'D', data: tD, borderColor:'#D92B2B', borderWidth:1.3 }}
+    ]}},
+    options: Object.assign({{}}, tOpts, {{ scales:{{ y:{{min:0,max:100}}, x:tOpts.scales.x }} }})
+  }});
 </script>
 </body>
 </html>'''
@@ -908,9 +1087,11 @@ def main():
             annual = annual_aggregate(periods)
             red_flag_items = red_flag_health_check(periods)
             growth_items = growth_health_check(code, periods, today)
+            price_rows = fetch_price_series(code, today)
+            tech = compute_technical(price_rows)
             analysis_path = Path(__file__).parent / f"analysis_{code}.html"
             analysis_path.write_text(
-                render_analysis_page(code, r.get("name"), periods, annual, red_flag_items, growth_items),
+                render_analysis_page(code, r.get("name"), periods, annual, red_flag_items, growth_items, tech),
                 encoding="utf-8",
             )
             print(f"  → {analysis_path}")
